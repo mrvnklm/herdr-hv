@@ -255,7 +255,8 @@ def ok(name, condition, detail=""):
 def hook_errors():
     logs = herdr("plugin", "log", "list").get("result", {}).get("logs", [])
     return [(e.get("event"), e.get("stderr", "")[-300:]) for e in logs
-            if e.get("plugin_id") == "hv" and (e.get("status") != "succeeded" or e.get("stderr", "").strip())]
+            if e.get("plugin_id") == "hv" and e.get("status") != "running"  # still busy is fine
+            and (e.get("status") != "succeeded" or e.get("stderr", "").strip())]
 
 
 def finish(client):
