@@ -1,0 +1,1449 @@
+#!/usr/bin/env python3
+"""hv — herdr views: put agents from any workspaces side by side.
+
+  hv [name]          pick agents (fzf, Tab = several), build a view
+  hv <pane-id>…      the same panels without the picker, in this order
+  hv add [pane-id…]  add panels to the focused view
+  hv eq              make the columns of the focused view equal width again
+  hv back [view] [pane-id…]  send panels back to their origin (default: all)
+  hv ls              list built views
+  hv group [group]   all agents of a group as a view `view:<group>`
+  hv group-sync      create a header "▦ <group>" per group, sort the sidebar
+  hv panel           endless loop for a control pane: mouse only, no shortcut
+
+  -m <machine>       work on another herdr server (`herdr machine list`)
+  -n                 only show what would happen (dry run)
+  -c                 always columns side by side, even from four panels on (otherwise a grid)
+
+Each call acts on ONE server. Without -m that is the local one.
+
+hv moves panes and never closes an agent. The only thing it closes is its own
+placeholder "hv stub" (an empty shell that keeps the space in the sidebar for `hv group`).
+A running agent survives every move; its pane_id changes, its terminal_id does not,
+so the remembered origin is keyed by terminal_id.
+"""
+import fcntl, fnmatch, json, math, os, re, shlex, socket, subprocess, sys, tempfile, time, traceback
+from contextlib import contextmanager
+from collections import namedtuple
+from shutil import which
+
+STUB_LABEL = "hv stub"
+LEGACY_ORIGINS = os.path.expanduser("~/.config/herdr/hv-origins")  # where hv < 0.3 kept them
+LEGACY_BUTTONS = ("+ Neuer Space",)  # lang-ok: button label of hv < 0.3, renamed by group-sync
+SELF_ENV = os.environ.get("HERDR_PANE_ID") or os.environ.get("HERDR_ACTIVE_PANE_ID")
+MACHINE = os.environ.get("HV_MACHINE") or None
+DRY = False
+FORCE_COLS = False
+PANEL_MODE = False  # never focus from the panel, or the view jumps away from it
+
+# Allowlist instead of denylist: only these verb pairs change anything. A denylist over
+# all arguments could have been defeated by a pane named "list".
+WRITING = {("pane", "move"), ("pane", "split"), ("pane", "rename"), ("pane", "close"), ("pane", "run"),
+           ("workspace", "create"), ("workspace", "focus"), ("workspace", "rename"),
+           ("workspace", "close"), ("workspace", "report-metadata"), ("plugin", "pane")}
+
+
+_STATE_DIR = None
+
+
+def state_dir():
+    """hv's plugin config dir: groups, origins, logs. The same place for hooks, panel and CLI."""
+    global _STATE_DIR
+    if _STATE_DIR is None:
+        found = subprocess.run(["herdr", "plugin", "config-dir", "hv"], capture_output=True,
+                               text=True).stdout.strip()
+        _STATE_DIR = found or os.path.expanduser("~/.config/herdr/plugins/config/hv")
+        os.makedirs(_STATE_DIR, exist_ok=True)
+    return _STATE_DIR
+
+
+def origins_path():
+    path = os.path.join(state_dir(), f"origins-{MACHINE}.json" if MACHINE else "origins.json")
+    legacy = f"{LEGACY_ORIGINS}-{MACHINE}.json" if MACHINE else f"{LEGACY_ORIGINS}.json"
+    if not os.path.exists(path) and os.path.exists(legacy):
+        os.replace(legacy, path)  # one-time move; agents out in a view still find their way home
+    return path
+
+
+def self_path():
+    """How to call this very file again (fzf preview, revived panel), wherever it is installed."""
+    return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.realpath(__file__))}"
+
+
+def herdr(*args):
+    """Call the herdr CLI. In a dry run, writing commands are only printed."""
+    if DRY and tuple(args[:2]) in WRITING:
+        print(f"  [dry] herdr {' '.join(args)}")
+        return None
+    prefix = ["--machine", MACHINE] if MACHINE else []
+    p = subprocess.run(["herdr", *prefix, *args], capture_output=True, text=True)
+    if not p.stdout.strip():
+        sys.exit(f"hv: `herdr {' '.join(args)}` returned nothing ({p.stderr.strip()})")
+    data = json.loads(p.stdout)
+    if "error" in data:
+        err = data["error"]
+        sys.exit(f"hv: `herdr {' '.join(args)}`: {err.get('message', err)}")
+    return data["result"]
+
+
+def self_pane():
+    """Current id of our own pane.
+
+    HERDR_PANE_ID holds the value from process start; when the pane moves it stays valid
+    as an alias but no longer matches `pane list`. `pane current` resolves the alias.
+    """
+    if not SELF_ENV:
+        return None
+    try:
+        return herdr("pane", "current", "--pane", SELF_ENV)["pane"]["pane_id"]
+    except SystemExit:
+        return SELF_ENV
+
+
+def herdr_text(*args):
+    """Like herdr(), but for commands that return raw text instead of JSON (`pane read`)."""
+    if DRY and tuple(args[:2]) in WRITING:
+        print(f"  [dry] herdr {' '.join(args)}")
+        return ""
+    prefix = ["--machine", MACHINE] if MACHINE else []
+    p = subprocess.run(["herdr", *prefix, *args], capture_output=True, text=True)
+    return p.stdout
+
+
+def load_origins():
+    try:
+        with open(origins_path(), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path, data):
+    """Atomic, with its own temp file, so two writers cannot clobber each other."""
+    if DRY:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".hv-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def save_origins(origins):
+    write_json(origins_path(), origins)
+
+
+LOCK_DEPTH = 0
+
+
+@contextmanager
+def state_lock():
+    """One run at a time for everything that moves panes or writes state.
+
+    Hooks, panel and CLI run concurrently. Reentrant within a process, because flock would
+    also block a second acquire by the same process (group() calls build() etc.).
+    """
+    global LOCK_DEPTH
+    if LOCK_DEPTH:
+        LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            LOCK_DEPTH -= 1
+        return
+    os.makedirs(os.path.dirname(origins_path()), exist_ok=True)
+    with open(origins_path() + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        LOCK_DEPTH = 1
+        try:
+            yield
+        finally:
+            LOCK_DEPTH = 0
+
+
+def workspaces():
+    return {w["workspace_id"]: w for w in herdr("workspace", "list")["workspaces"]}
+
+
+def panes():
+    return herdr("pane", "list")["panes"]
+
+
+def is_view(label):
+    return label.startswith("view:")
+
+
+def focused_view():
+    for wid, w in workspaces().items():
+        if w.get("focused"):
+            if not is_view(w["label"]):
+                sys.exit(f"hv: '{w['label']}' is not an hv view — focus one first")
+            return wid, w
+    sys.exit("hv: no workspace focused")
+
+
+def view_panes(wid):
+    """Panes of the view, left to right."""
+    own = [p["pane_id"] for p in panes() if p["pane_id"].startswith(f"{wid}:")]
+    lay = herdr("pane", "layout", "--pane", own[0]) if own else None
+    if lay:
+        ordered = sorted(lay["layout"]["panes"], key=lambda p: (p["rect"]["x"], p["rect"]["y"]))
+        return [p["pane_id"] for p in ordered]
+    return own
+
+
+FZF_MIN = (0, 45)  # `transform` in the popup
+
+
+def require_fzf():
+    if not which("fzf"):
+        sys.exit("hv: fzf is missing — brew install fzf")
+    found = re.match(r"(\d+)\.(\d+)", subprocess.run(["fzf", "--version"], capture_output=True,
+                                                     text=True).stdout)
+    if found and tuple(map(int, found.groups())) < FZF_MIN:
+        sys.exit(f"hv: fzf {found.group(0)} is too old, {'.'.join(map(str, FZF_MIN))}+ is required")
+
+
+def pick(prompt, extra=()):
+    require_fzf()
+    ws = workspaces()
+    mine = self_pane()
+    rows = list(extra)
+    # Blocked first: whatever waits for an answer should not sit at the bottom.
+    rank = {"blocked": 0, "done": 1, "working": 2, "idle": 3}
+    ordered = sorted(panes(), key=lambda p: (rank.get(p.get("agent_status", ""), 4),
+                                             p.get("label") or ""))
+    for pane in ordered:
+        # Never offer our own pane, or the control pane moves itself
+        # into the view it is building.
+        if mine and pane["pane_id"] == mine:
+            continue
+        label = pane.get("label") or pane.get("agent") or "Shell"
+        space = ws.get(pane["pane_id"].split(":")[0], {}).get("label", "?")
+        mark = {"working": "●", "blocked": "!", "done": "✓", "idle": "○"}.get(
+            pane.get("agent_status", ""), " ")
+        rows.append((f"{mark} {space:<20} {label}", pane["pane_id"]))
+    if not rows:
+        sys.exit("hv: no panes")
+    text = "\n".join(f"{disp}\t{val}" for disp, val in rows)
+    # Mouse: click marks, double-click builds right away. fzf moves the cursor to the
+    # clicked line anyway; `toggle` marks it as well.
+    p = subprocess.run(
+        ["fzf", "--multi", "--delimiter", "\t", "--with-nth", "1",
+         "--prompt", prompt,
+         "--header", "Click marks · double-click builds",
+         "--bind", "left-click:toggle",
+         "--bind", "double-click:accept",
+         "--preview", f"{self_path()} {mflag()} preview {{2}}",
+         # Below 100 columns the preview moves to the bottom; beside it, a typical
+         # panel split would leave only ~28 characters for the names.
+         "--preview-window", "right,52%,border-left,wrap,<100(down,45%,border-top,wrap)",
+         "--marker", "▸ ", "--pointer", "›",
+         "--height", "100%", "--reverse", "--cycle"],
+        input=text, capture_output=True, text=True)
+    # 130 = ctrl+c, 2 = fzf error. Both must be able to end the panel, otherwise the
+    # loop runs forever and swallows every input that follows.
+    if p.returncode in (2, 130):
+        raise KeyboardInterrupt
+    return [line.split("\t")[-1] for line in p.stdout.splitlines() if line.strip()]
+
+
+def arrange(tab, first_pane, rest):
+    """Lay out first_pane + rest as an even grid in `tab`.
+
+    At most three panels side by side, the rest in rows below (4 → 3+1, 6 → 3×2),
+    because four columns on a laptop would be barely 30 characters wide. `-c` forces columns.
+    Read row by row: 1 2 3 / 4 5 6.
+    """
+    ids = [first_pane] + list(rest)
+    n = len(ids)
+    cols = n if FORCE_COLS else min(n, 3)
+    grid = [ids[r * cols:(r + 1) * cols] for r in range(math.ceil(n / cols))]
+
+    # Row 0: the column heads side by side, equal width.
+    heads = [first_pane]
+    target = first_pane
+    for i, pane_id in enumerate(grid[0][1:], 2):
+        target = move_into(pane_id, tab, "right", target, 1 / (cols - i + 2))
+        heads.append(target)
+
+    # Fill each column downwards, rows within a column equal height.
+    for c, head in enumerate(heads):
+        below = [row[c] for row in grid[1:] if c < len(row)]
+        k = len(below) + 1
+        target = head
+        for i, pane_id in enumerate(below, 2):
+            target = move_into(pane_id, tab, "down", target, 1 / (k - i + 2))
+    return target
+
+
+def move_into(pane_id, tab, direction, target, ratio):
+    """One move with a split; returns the new pane id (a placeholder in a dry run)."""
+    res = herdr("pane", "move", pane_id, "--tab", tab, "--split", direction,
+                "--target-pane", target, "--ratio", f"{ratio}", "--no-focus")
+    return res["move_result"]["pane"]["pane_id"] if res else f"<{pane_id}>"
+
+
+def rebuild(view, ordered):
+    """Rearrange an existing view into equal-width columns.
+
+    A `pane move` WITHIN the same tab does not clean up the existing split hierarchy;
+    arrange() alone then yields 40/40/20/20 instead of 30/30/30/30. So every pane but
+    the first goes to a parking workspace first and comes back from there with the
+    right ratios. The first pane stays put so the view does not go empty and vanish.
+    """
+    keep, rest = ordered[0], ordered[1:]
+    if not rest:
+        return
+    res = herdr("pane", "move", rest[0], "--new-workspace", "--label", "view:…", "--no-focus")
+    if not res:
+        print(f"  [dry] park {len(rest)} panels and bring them back at equal width")
+        return
+    parked = [res["move_result"]["pane"]["pane_id"]]
+    park_tab = parked[0].split(":")[0] + ":t1"
+    for pane_id in rest[1:]:
+        r = herdr("pane", "move", pane_id, "--tab", park_tab, "--split", "right", "--no-focus")
+        parked.append(r["move_result"]["pane"]["pane_id"])
+    arrange(f"{view}:t1", keep, parked)
+
+
+def leave_stub(origins, pane, chosen):
+    """Placeholder pane so the space stays in the sidebar when all its panes move out.
+
+    Without it herdr closes the space, and hv back would have to recreate it with a new id.
+    Only what stays behind counts: otherwise a space with two agents loses both without a placeholder.
+    """
+    space = pane["pane_id"].split(":")[0]
+    if pane["terminal_id"] not in origins:  # without an origin hv back would never find it again
+        return
+    if any(p["pane_id"].startswith(f"{space}:") and p["pane_id"] not in chosen for p in panes()):
+        return
+    stub = herdr("pane", "split", pane["pane_id"], "--direction", "down", "--no-focus",
+                 *(["--cwd", pane["cwd"]] if pane.get("cwd") else []))
+    if stub:
+        herdr("pane", "rename", stub["pane"]["pane_id"], STUB_LABEL)
+        origins[pane["terminal_id"]]["stub"] = stub["pane"]["terminal_id"]
+
+
+def close_stub(origin):
+    """Close only the pane hv created itself. The name is no proof: processes in the shell
+    overwrite it (e.g. a command run from the shell's rc file)."""
+    for pane in panes():
+        if pane["terminal_id"] == origin.get("stub") and not pane.get("agent") \
+                and is_plain_shell(pane["pane_id"]):  # vim, ssh, a dev server stay open
+            herdr("pane", "close", pane["pane_id"])
+
+
+def remember(origins, pane, ws):
+    if pane["terminal_id"] in origins:  # already away: the first origin is the real one
+        return
+    space = ws.get(pane["pane_id"].split(":")[0], {})
+    label = space.get("label")
+    if label and not is_view(label):
+        # The id counts, the name is only a fallback: a space named after its cwd, or renamed,
+        # would otherwise send the pane to another space with the same name.
+        origins[pane["terminal_id"]] = {"label": label, "cwd": pane.get("cwd", ""),
+                                        "workspace_id": pane["pane_id"].split(":")[0]}
+
+
+def free_label(ws, wish=None):
+    used = {w["label"] for w in ws.values()}
+    if wish:
+        name = f"view:{wish}"
+        if name in used:
+            sys.exit(f"hv: '{name}' already exists")
+        return name
+    for i in range(1, 100):
+        if f"view:{i}" not in used:
+            return f"view:{i}"
+    sys.exit("hv: no free view number")
+
+
+def check_known(chosen):
+    known = {p["pane_id"] for p in panes()}
+    for pid in chosen:
+        if pid not in known:
+            sys.exit(f"hv: pane '{pid}' does not exist")
+
+
+def build(args, focus=True, stubs=False):
+    wish = None
+    if args and ":" not in args[0]:
+        wish, args = args[0], args[1:]
+    chosen = args or pick("Panels> ")
+    if not chosen:
+        sys.exit(0)
+    with state_lock():
+        build_now(wish, chosen, focus, stubs)
+
+
+def build_now(wish, chosen, focus, stubs):
+    check_known(chosen)
+
+    ws = workspaces()
+    label = free_label(ws, wish)
+    by_id = {p["pane_id"]: p for p in panes()}
+    origins = load_origins()
+    for pid in chosen:
+        remember(origins, by_id[pid], ws)
+        if stubs:
+            leave_stub(origins, by_id[pid], chosen)
+    save_origins(origins)  # before the first move: if one aborts, back still finds the panes
+
+    res = herdr("pane", "move", chosen[0], "--new-workspace", "--label", label, "--no-focus")
+    if not res:
+        print(f"  [dry] then: append {len(chosen) - 1} more panels to the right, equal width")
+        print(f"  [dry] result: view '{label}' with {len(chosen)} panels")
+        return
+    first = res["move_result"]["pane"]["pane_id"]
+    view = first.split(":")[0]
+    arrange(f"{view}:t1", first, chosen[1:])
+    if focus:
+        herdr("workspace", "focus", view)
+        print(f"hv: built '{label}' with {len(chosen)} panels. Undo with: {me()} back")
+    else:
+        # Do NOT focus in panel mode: the jump would take the panel pane out of
+        # sight. The view is in the sidebar and can be clicked there.
+        print(f"  ✓ built '{label}' with {len(chosen)} panels — click it in the sidebar")
+
+
+def add(args):
+    wid, w = focused_view()
+    chosen = args or pick("add> ")
+    if not chosen:
+        sys.exit(0)
+    with state_lock():
+        add_now(wid, w, chosen)
+
+
+def add_now(wid, w, chosen):
+    check_known(chosen)
+    ws = workspaces()
+    by_id = {p["pane_id"]: p for p in panes()}
+    origins = load_origins()
+    for pid in chosen:
+        remember(origins, by_id[pid], ws)
+    save_origins(origins)
+    current = [p for p in view_panes(wid) if p not in chosen]
+    moved = []
+    for pane_id in chosen:
+        r = herdr("pane", "move", pane_id, "--tab", f"{wid}:t1", "--split", "right", "--no-focus")
+        moved.append(r["move_result"]["pane"]["pane_id"] if r else pane_id)
+    rebuild(wid, current + moved)
+    print(f"hv: added {len(chosen)} panel(s) to '{w['label']}'")
+
+
+def eq(_args):
+    wid, w = focused_view()
+    order = view_panes(wid)
+    if len(order) < 2:
+        sys.exit("hv: nothing to equalize")
+    rebuild(wid, order)
+    print(f"hv: '{w['label']}' set to {len(order)} equal columns")
+
+
+def named_view(name):
+    """View by label (`view:x` or just `x`) or workspace id — without changing focus."""
+    for wid, w in workspaces().items():
+        if wid == name or w["label"] in (name, f"view:{name}"):
+            if not is_view(w["label"]):
+                sys.exit(f"hv: '{w['label']}' is not an hv view")
+            return wid, w
+    sys.exit(f"hv: no view '{name}' found")
+
+
+def back(args):
+    # A view name as the first argument dissolves that view without moving focus;
+    # otherwise the user's screen would jump away in the middle of their work.
+    if args and not PANE_ID.match(args[0]):
+        wid, w = named_view(args[0])
+        args = args[1:]
+    else:
+        wid, w = focused_view()
+    mine = [p for p in panes() if p["pane_id"].startswith(f"{wid}:")]
+    if args:
+        check_known(args)
+        mine = [p for p in mine if p["pane_id"] in args]
+    if not mine:
+        sys.exit("hv: nothing to send back")
+    send_home(mine)
+
+
+def send_home(mine):
+    origins = load_origins()
+    ws = workspaces()
+    spaces = {v["label"]: k for k, v in ws.items()}
+    moved = 0
+    try:
+        for pane in mine:
+            origin = origins.get(pane["terminal_id"])
+            if not origin:
+                print(f"hv: origin of '{pane.get('label')}' unknown, leaving it here")
+                continue
+            dest = origin.get("workspace_id") if origin.get("workspace_id") in ws else spaces.get(origin["label"])
+            if dest:
+                tab = ws.get(dest, {}).get("active_tab_id") or f"{dest}:t1"
+                herdr("pane", "move", pane["pane_id"], "--tab", tab, "--split", "right", "--no-focus")
+                close_stub(origin)
+            else:
+                res = herdr("pane", "move", pane["pane_id"], "--new-workspace",
+                            "--label", origin["label"], "--no-focus")
+                if res:
+                    spaces[origin["label"]] = res["move_result"]["pane"]["pane_id"].split(":")[0]
+            origins.pop(pane["terminal_id"], None)
+            moved += 1
+    finally:
+        save_origins(origins)  # whatever is already home loses its entry even if a move aborts
+    store = group_store() if moved and not DRY else None
+    if store:  # a recreated origin lands at the end of the sidebar, outside its group
+        normalize(store)
+    print(f"hv: sent {moved} panel(s) back")
+
+
+GROUP_MAX = 9  # more than 3×3 becomes unreadable on a laptop
+
+
+Record = namedtuple("Record", "workspace_id tag cwd label")  # tag "" = keep rules off
+Rule = namedtuple("Rule", "tag labels cwds")
+GroupConfig = namedtuple("GroupConfig", "order rules")
+MAX_TAG = 24  # longer names get cut off in the default sidebar
+
+
+class Groups:
+    """Which space belongs to which group: `groups.json` in hv's plugin config dir.
+
+    {"order": [group, …], "rules": [{"tag", "labels", "cwds"}], "members": {workspace_id:
+    {"tag", "cwd", "label"}}}. A member entry wins over the rules; an empty tag keeps the rules
+    off that space. cwd and label let a reopened space find its group again (adopt).
+    """
+
+    def __init__(self, directory):
+        self.path = os.path.join(directory, "groups.json")
+
+    def _read(self):
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except ValueError as exc:
+            sys.exit(f"hv: {self.path} is not valid JSON ({exc})")
+
+    def _write(self, data):
+        write_json(self.path, data)
+
+    # -- reading
+    def load_config(self):
+        data = self._read()
+        rules = [Rule(r["tag"], list(r.get("labels", [])), list(r.get("cwds", [])))
+                 for r in data.get("rules", []) if r.get("tag")]
+        return GroupConfig(list(data.get("order", [])), rules)
+
+    def load_mapping(self):
+        return [Record(wid, m.get("tag", ""), m.get("cwd", ""), m.get("label", ""))
+                for wid, m in self._read().get("members", {}).items()]
+
+    @staticmethod
+    def validate_tag(value):
+        tag = " ".join(value.split())
+        if not tag:
+            sys.exit("hv: a group name must not be empty")
+        if len(tag) > MAX_TAG:
+            sys.exit(f"hv: a group name has at most {MAX_TAG} characters")
+        return tag
+
+    @staticmethod
+    def match_rules(label, cwd, rules):
+        """The first rule whose label glob (case-insensitive) or cwd glob matches."""
+        for rule in rules:
+            if any(fnmatch.fnmatchcase(label.casefold(), p.casefold()) for p in rule.labels):
+                return rule.tag
+            if cwd and any(fnmatch.fnmatchcase(cwd, os.path.expanduser(p)) for p in rule.cwds):
+                return rule.tag
+        return None
+
+    def resolved_tags(self, spaces, cwds, records=None, config=None):
+        """{workspace_id: group or ""} for every space."""
+        records = self.load_mapping() if records is None else records
+        config = self.load_config() if config is None else config
+        manual = {r.workspace_id: r.tag for r in records}
+        return {ws["workspace_id"]: (manual[ws["workspace_id"]] if ws["workspace_id"] in manual
+                                     else self.match_rules(ws.get("label", ""),
+                                                           cwds.get(ws["workspace_id"], ""),
+                                                           config.rules)) or ""
+                for ws in spaces}
+
+    @staticmethod
+    def tag_order(order, tags):
+        """Saved order first, then the other groups as they appear. Never alphabetical."""
+        known = list(order)
+        for tag in tags:
+            if tag and tag not in known:
+                known.append(tag)
+        return known
+
+    def snapshot_state(self):
+        """The workspaces in sidebar order plus each workspace's cwd."""
+        snapshot = herdr("api", "snapshot")["snapshot"]
+        spaces = [ws for ws in snapshot.get("workspaces", []) if ws.get("workspace_id")]
+        cwds = {}
+        for pane in snapshot.get("panes", []):
+            if pane.get("workspace_id") and pane.get("cwd"):
+                cwds.setdefault(pane["workspace_id"], pane["cwd"])
+        return spaces, cwds
+
+    # -- writing
+    def save_order(self, order):
+        data = self._read()
+        data["order"] = list(order)
+        self._write(data)
+
+    def _set(self, wid, tag, cwd, label):
+        data = self._read()
+        data.setdefault("members", {})[wid] = {"tag": tag, "cwd": cwd, "label": label}
+        self._write(data)
+
+    def apply_tag(self, wid, tag, cwd="", label=""):
+        self._set(wid, self.validate_tag(tag), cwd, label)
+        self.regroup()
+
+    def retag(self, old, new):
+        """Every member of `old` moves to `new`: one write, one regroup."""
+        data = self._read()
+        for entry in data.get("members", {}).values():
+            if entry.get("tag") == old:
+                entry["tag"] = new
+        self._write(data)
+        self.regroup()
+
+    def clear_tag(self, wid, cwd="", label=""):
+        """Out of every group, and the rules stay off this space."""
+        self._set(wid, "", cwd, label)
+        self.regroup()
+
+    def reset_tag(self, wid):
+        """Forget the manual entry; the rules decide again."""
+        data = self._read()
+        if data.get("members", {}).pop(wid, None) is not None:
+            self._write(data)
+        self.regroup()
+
+    def adopt(self, spaces=None, cwds=None):
+        """A space with a new id (reopened, server restart) takes over the entry of a closed
+        space with the same cwd, otherwise the same label. True when something changed."""
+        if spaces is None:
+            spaces, cwds = self.snapshot_state()
+        data = self._read()
+        members = data.get("members", {})
+        live = {ws["workspace_id"] for ws in spaces}
+        changed = False
+        for ws in spaces:
+            wid = ws["workspace_id"]
+            if wid in members or ws.get("label") == NEW_BUTTON:
+                continue
+            stale = [k for k in members if k not in live]
+            label = ws.get("label", "")
+            # a header sits in ~ like many spaces, so it is matched by its label only
+            cwd = "" if header_tag(label) else cwds.get(wid, "")
+            match = next((k for k in stale if cwd and members[k].get("cwd") == cwd), None) \
+                or next((k for k in stale if label and members[k].get("label") == label), None)
+            if match:
+                entry = members.pop(match)
+                members[wid] = {**entry, "cwd": cwd or entry.get("cwd", ""),
+                                "label": label or entry.get("label", "")}
+                changed = True
+        if changed:
+            self._write(data)
+        return changed
+
+    # -- sidebar
+    def socket_request(self, method, params):
+        """One raw request on the herdr socket: `workspace.move_block` has no CLI command."""
+        if DRY:
+            print(f"  [dry] {method} {json.dumps(params)}")
+            return {}
+        # outside herdr (ssh, cron) the variable is missing; herdr's default socket is the same
+        path = os.environ.get("HERDR_SOCKET_PATH") or os.path.expanduser("~/.config/herdr/herdr.sock")
+        if not os.path.exists(path):
+            sys.exit(f"hv: no herdr socket at {path}")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(path)
+            sock.sendall(json.dumps({"id": f"hv:{os.getpid()}", "method": method,
+                                     "params": params}).encode() + b"\n")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        response = json.loads(buf.decode() or "{}")
+        if "error" in response:
+            err = response["error"]
+            sys.exit(f"hv: {method}: {err.get('message', err) if isinstance(err, dict) else err}")
+        return response.get("result", {})
+
+    def regroup(self):
+        """Each group one block in the sidebar, groups in the saved order, ungrouped last."""
+        spaces, cwds = self.snapshot_state()
+        tags = self.resolved_tags(spaces, cwds)
+        if not any(tags.values()):
+            return False
+        rank = {t: i for i, t in enumerate(self.tag_order(self.load_config().order, tags.values()))}
+        units = unit_groups(spaces)
+
+        def key(item):
+            index, unit = item
+            tag = next((tags[ws["workspace_id"]] for ws in unit if tags.get(ws["workspace_id"])), "")
+            return (0, rank[tag], index) if tag else (1, 0, index)
+
+        desired = [ws["workspace_id"] for _, unit in sorted(enumerate(units), key=key) for ws in unit]
+        if desired == [ws["workspace_id"] for ws in spaces]:
+            return False
+        self.socket_request("workspace.move_block", {"workspace_ids": desired})
+        return True
+
+
+def unit_groups(spaces):
+    """Worktree spaces travel with their repo, parent first; every other space stands alone."""
+    units, at = [], {}
+    for ws in spaces:
+        key = (ws.get("worktree") or {}).get("repo_key")
+        if key and key in at:
+            units[at[key]].append(ws)
+        else:
+            if key:
+                at[key] = len(units)
+            units.append([ws])
+    for unit in units:
+        unit.sort(key=lambda ws: bool((ws.get("worktree") or {}).get("is_linked_worktree")))
+    return units
+
+
+def group_store():
+    """hv's group store for this server, or None with -m: it needs the local socket."""
+    if MACHINE:
+        return None
+    return Groups(state_dir())
+
+
+def groups():
+    """{group: [agent panes in sidebar order]} for all tagged spaces."""
+    mod = group_store()
+    if not mod:
+        sys.exit("hv: groups need the local herdr server" + (" (not with -m)" if MACHINE else ""))
+    spaces, cwds = mod.snapshot_state()
+    tags = mod.resolved_tags(spaces, cwds, mod.load_mapping(), mod.load_config())
+    order = {ws["workspace_id"]: i for i, ws in enumerate(spaces)}
+    headers = {ws["workspace_id"] for ws in spaces if header_tag(ws.get("label", ""))}
+    mine = self_pane()
+    out = {}
+    for pane in sorted(panes(), key=lambda p: (order.get(p["pane_id"].split(":")[0], 999),
+                                               p["pane_id"])):
+        space = pane["pane_id"].split(":")[0]
+        tag = tags.get(space)
+        if tag and pane.get("agent") and pane["pane_id"] != mine and space not in headers:
+            out.setdefault(tag, []).append(pane["pane_id"])
+    return out
+
+
+def is_plain_shell(pane_id):
+    """Only a shell in the foreground? Otherwise something runs there that hv must not close."""
+    for attempt in range(4):  # a fresh shell may still be running its rc file
+        try:
+            info = herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+        except SystemExit:
+            return False
+        names = [os.path.basename((p.get("argv") or [""])[0]).lstrip("-")
+                 for p in info.get("foreground_processes") or []]
+        if names and all(n in ("zsh", "bash", "sh", "fish") for n in names):  # empty = unknown
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def open_in_header(header, chosen):
+    """The header is the combined view: agents move into its tab, the shell makes room."""
+    ws = workspaces()
+    by_id = {p["pane_id"]: p for p in panes()}
+    origins = load_origins()
+    for pid in chosen:
+        remember(origins, by_id[pid], ws)
+        leave_stub(origins, by_id[pid], chosen)
+    save_origins(origins)
+    tab = f"{header}:t1"
+    old = [p["pane_id"] for p in panes() if p["pane_id"].startswith(f"{header}:")]
+    first = move_into(chosen[0], tab, "right", old[0], 0.5)
+    for pid in old:
+        if is_plain_shell(pid):
+            herdr("pane", "close", pid)
+    arrange(tab, first, chosen[1:])
+    print(f"hv: {len(chosen)} panels in '{ws[header]['label']}'")
+
+
+def guests(header, plist=None, origins=None):
+    """Panes in the header that have to go back. The origin decides, not `agent`:
+    a finished agent goes home too, one started right there stays."""
+    origins = load_origins() if origins is None else origins
+    return [p for p in (panes() if plist is None else plist)
+            if p["pane_id"].startswith(f"{header}:") and p["terminal_id"] in origins]
+
+
+def close_header(header):
+    """Guests back to their spaces. If nothing would remain, a new shell keeps the space open."""
+    mine = guests(header)
+    if not mine:
+        return False
+    if sum(p["pane_id"].startswith(f"{header}:") for p in panes()) == len(mine):
+        shell = herdr("pane", "split", mine[0]["pane_id"], "--direction", "down", "--no-focus",
+                      "--cwd", os.path.expanduser("~"))
+        herdr("pane", "rename", shell["pane"]["pane_id"], "Shell")
+    send_home(mine)
+    return True
+
+
+def group(args):
+    found = groups()
+    if not found:
+        sys.exit("hv: no agent in any group")
+    name = args[0] if args else pick_group(found)
+    if not name:
+        sys.exit(0)
+    with state_lock():
+        group_now(name)
+
+
+def group_now(name):
+    found = groups()
+    if name not in found:
+        sys.exit(f"hv: group '{name}' has no agents (available: {', '.join(found)})")
+    existing = [w for w in workspaces().values() if w["label"] == f"view:{name}"]
+    if existing:
+        herdr("workspace", "focus", existing[0]["workspace_id"])
+        print(f"hv: 'view:{name}' already exists — focused. Dissolve with: {me()} back")
+        return
+    chosen = found[name]
+    if len(chosen) > GROUP_MAX:
+        print(f"hv: {len(chosen)} agents in '{name}', only the first {GROUP_MAX} go into the view")
+        chosen = chosen[:GROUP_MAX]
+    header = next((w["workspace_id"] for w in workspaces().values()
+                   if header_tag(w["label"]) == name), None)
+    if header:
+        open_in_header(header, chosen)
+    else:
+        build([name, *chosen], focus=not PANEL_MODE, stubs=True)
+
+
+def pick_group(found):
+    rows = [(f"▦  {tag:<16} {len(ids)} agent(s)", tag) for tag, ids in found.items()]
+    return (pick_rows("Group> ", rows, multi=False) or [None])[0]
+
+
+def pick_rows(prompt, rows, multi=True, query=False, header="Double-click or Enter selects"):
+    """fzf over fixed rows (display, value); click selects, double-click confirms.
+
+    With query=True it returns (typed text, selection), even when nothing matched."""
+    require_fzf()
+    text = "\n".join(f"{disp}\t{val}" for disp, val in rows)
+    p = subprocess.run(
+        ["fzf", *(["--multi"] if multi else []), "--delimiter", "\t", "--with-nth", "1",
+         "--prompt", prompt, "--header", header,
+         "--bind", "double-click:accept",
+         # Typed text + Enter is a name, not a filter: otherwise "test" fuzzy-matches and
+         # opens some unrelated folder. Folders are picked by double-click.
+         *(["--print-query", "--bind", "enter:transform:[ -n {q} ] && echo print-query || echo accept"]
+           if query else []),
+         "--height", "100%", "--reverse", "--cycle"],
+        input=text, capture_output=True, text=True)
+    if p.returncode in (2, 130):
+        raise KeyboardInterrupt
+    lines = p.stdout.splitlines()
+    typed = lines.pop(0) if query and lines else ""
+    known = {val for _, val in rows}  # without a match fzf prints the query a second time
+    picked = [v for v in (line.split("\t")[-1] for line in lines if line.strip()) if v in known]
+    return (typed, picked) if query else picked
+
+
+def panel(_args):
+    """Stays open and asks again and again. Meant for a narrow pane that is never
+    closed: click into it, click agents, double-click — no shortcut.
+    """
+    if not sys.stdin.isatty():
+        sys.exit("hv: `panel` needs a real pane (no TTY)")
+    global PANEL_MODE
+    PANEL_MODE = True
+    print("  hv panel — click marks, double-click builds. Close with a right-click.")
+    while True:
+        try:
+            views = [w for w in workspaces().values() if is_view(w["label"])]
+            extra = [(f"↩  dissolve {v['label']}", f"!back:{v['workspace_id']}") for v in views]
+            try:
+                found = groups()
+            except SystemExit:
+                found = {}  # without a group store there are simply no group rows
+            extra += [(f"▦  Group {tag} · {len(ids)} agent(s)", f"!group:{tag}")
+                      for tag, ids in found.items()]
+            chosen = pick("build> ", extra)
+            if not chosen:
+                time.sleep(0.3)  # no busy loop when the selection is cancelled
+                continue
+            if chosen[0].startswith("!back:"):
+                with state_lock():
+                    back([chosen[0][len("!back:"):]])
+            elif chosen[0].startswith("!group:"):
+                with state_lock():
+                    group([chosen[0][len("!group:"):]])
+            else:
+                with state_lock():
+                    build(chosen, focus=False)
+            time.sleep(1.6)
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                print(f"\n  {exc.code}")
+                time.sleep(2.5)
+        except KeyboardInterrupt:
+            print("\n  hv panel stopped.")
+            return
+        except Exception as exc:  # a single error does not end the panel
+            print(f"\n  Error: {exc}")
+            time.sleep(2.5)
+
+
+# ------------------------------------------------------------ groups in the sidebar
+#
+# Mouse only, no panel of its own: each group has its own space "▦ <group>" as a header.
+# Dragging a space below a group assigns it. The header IS the combined view: clicking it
+# pulls the agents into its tab, clicking another row sends them back. The spaces stay
+# in place meanwhile (leave_stub).
+# The hooks are declared in herdr-plugin.toml.
+
+HEADER = "▦ "
+NEW_GROUP = "#"  # naming a space "#clients" creates the group "clients"
+NEW_BUTTON = "+ New space"  # bottom row: a click opens the picker (new_space)
+NOT_PROJECTS = {"Applications", "Desktop", "Documents", "Downloads", "Library", "Movies",
+                "Music", "Pictures", "Public"}
+
+
+def header_tag(label):
+    return label[len(HEADER):] if label.startswith(HEADER) else None
+
+
+def sidebar_state(mod):
+    """(spaces in sidebar order, cwds, group per space)."""
+    spaces, cwds = mod.snapshot_state()
+    return spaces, cwds, mod.resolved_tags(spaces, cwds, mod.load_mapping(), mod.load_config())
+
+
+def sync_gaps(mod):
+    """Blank line between blocks: token `$gap` on each block's last space, only when changed.
+
+    On the last space rather than the header, because herdr indents every line after the first.
+    """
+    spaces, _, tags = sidebar_state(mod)
+    for i, ws in enumerate(spaces):
+        wid = ws["workspace_id"]
+        below = spaces[i + 1]["workspace_id"] if i + 1 < len(spaces) else None
+        at_button = bool(below) and spaces[i + 1].get("label") == NEW_BUTTON
+        want = at_button or (bool(below) and tags.get(wid, "") != tags.get(below, ""))
+        if want != bool((ws.get("tokens") or {}).get("gap")):
+            herdr_text("workspace", "report-metadata", wid, "--source", "hv:groups",
+                       *(["--token", "gap=\u2800"] if want else ["--clear-token", "gap"]))
+
+
+def save_group_order(mod, order):
+    mod.save_order(order)
+
+
+def pin_order(mod, skip=None):
+    """The group order is the one currently shown in the sidebar.
+
+    Groups missing from `order` would otherwise be sorted alphabetically, which contradicts
+    dragging, so the visible order is pinned before every re-sort: per group the header counts,
+    without a header the first member. `skip` is the row being dragged, whose new position
+    does not count yet.
+    """
+    spaces, _, tags = sidebar_state(mod)
+    seen = []
+    headed = {header_tag(s.get("label", "")) for s in spaces} - {None}
+    for s in spaces:
+        if s["workspace_id"] == skip:
+            continue
+        tag = header_tag(s.get("label", "")) or tags.get(s["workspace_id"], "")
+        if not tag or tag in seen or (tag in headed and not header_tag(s.get("label", ""))):
+            continue
+        seen.append(tag)
+    for s in spaces:  # a group whose header is being dragged: at its first member
+        tag = tags.get(s["workspace_id"], "")
+        if tag and tag not in seen:
+            seen.append(tag)
+    if seen != list(mod.load_config().order):
+        save_group_order(mod, seen)
+
+
+def normalize(mod):
+    """Sort groups as blocks, each header on top, the button last."""
+    spaces, _, tags = sidebar_state(mod)
+    for ws in spaces:
+        # old assignments are adopted by cwd; that must not hit the button
+        if ws.get("label") == NEW_BUTTON and tags.get(ws["workspace_id"]):
+            mod.reset_tag(ws["workspace_id"])
+    mod.regroup()
+    spaces, _, tags = sidebar_state(mod)
+    for ws in spaces:
+        tag = header_tag(ws.get("label", ""))
+        members = [s for s in spaces if tags.get(s["workspace_id"]) == tag]
+        if tag and members and members[0]["workspace_id"] != ws["workspace_id"]:
+            mod.socket_request("workspace.move_block", {
+                "workspace_ids": [ws["workspace_id"]],
+                "before_workspace_id": members[0]["workspace_id"]})
+            spaces, _, tags = sidebar_state(mod)
+    button = next((s["workspace_id"] for s in spaces if s.get("label") == NEW_BUTTON), None)
+    if button and spaces[-1]["workspace_id"] != button:
+        mod.socket_request("workspace.move_block", {"workspace_ids": [button]})
+
+
+def dragged_order(mod, rows, tags, index, tag):
+    """New group order after the header of `tag` has landed at `index`.
+
+    herdr drops the row AFTER the target row, so dragging onto another group's header lands
+    in the middle of its block. That means: past that group, before or after it depending on
+    the drag direction. Only at a block boundary is the position taken literally.
+    """
+    old = mod.tag_order(mod.load_config().order, [t for t in tags.values() if t])
+    others = [t for t in old if t != tag]
+    above = tags.get(rows[index - 1]["workspace_id"], "") if index else ""
+    below = tags.get(rows[index + 1]["workspace_id"], "") if index + 1 < len(rows) else ""
+    if not above:  # at the very top means first, among the ungrouped spaces means last
+        return [tag] + others if not index else others + [tag]
+    at = others.index(above)
+    moving_up = old.index(tag) > old.index(above)
+    return others[:at] + [tag] + others[at:] if above == below and moving_up \
+        else others[:at + 1] + [tag] + others[at + 1:]
+
+
+def on_moved(mod, wid):
+    """Drag in the sidebar: the space now belongs to whatever sits directly above it."""
+    pin_order(mod, skip=wid)
+    spaces, cwds, tags = sidebar_state(mod)
+    rows = [s for s in spaces if not is_view(s.get("label", ""))]
+    index = next((i for i, s in enumerate(rows) if s["workspace_id"] == wid), None)
+    if index is None:
+        return
+    label = rows[index].get("label", "")
+    if header_tag(label) is None and label != NEW_BUTTON:
+        above = tags.get(rows[index - 1]["workspace_id"], "") if index else ""  # at the top: out
+        cwd = cwds.get(wid, "")
+        # Below an empty group there is only its blank line, which belongs to the header. Dragging
+        # onto the name therefore lands above it instead of below, but the group is what is meant.
+        below = rows[index + 1] if index + 1 < len(rows) else {}
+        below_tag = header_tag(below.get("label", ""))
+        if below_tag and (not above or tags.get(wid, "") != above) \
+                and not any(t == below_tag and w != below["workspace_id"] for w, t in tags.items()):
+            above = below_tag
+        if above and above != tags.get(wid, ""):
+            mod.apply_tag(wid, above, cwd, label)
+        elif not above and tags.get(wid):
+            # remember "no" when a rule matches, otherwise the rule pulls the space back
+            if mod.match_rules(label, cwd, mod.load_config().rules):
+                mod.clear_tag(wid, cwd, label)
+            else:
+                mod.reset_tag(wid)
+    elif header_tag(label):  # header dragged: the whole group follows
+        save_group_order(mod, dragged_order(mod, rows, tags, index, header_tag(label)))
+    normalize(mod)
+
+
+def on_focused(mod, wid):
+    """Click in the sidebar: a header shows its group, any other row its single session."""
+    ws = workspaces()
+    if wid not in ws or is_view(ws[wid]["label"]):
+        return
+    if ws[wid]["label"] == NEW_BUTTON:  # the open group stays until something new is created
+        herdr_text("plugin", "pane", "open", "--plugin", "hv", "--entrypoint", "new-space")
+        return
+    with open(origins_path() + ".last", "w") as fh:
+        fh.write(wid)
+    # Only the group that currently holds the clicked space's session closes. All others
+    # stay open: a second herdr window may be showing them right now.
+    origins = load_origins()
+    label = ws[wid]["label"]
+
+    plist = panes()
+
+    def holds(header):
+        found = (origins.get(p["terminal_id"], {}) for p in guests(header, plist, origins))
+        return any(o.get("workspace_id") == wid
+                   or (not o.get("workspace_id") and o.get("label") == label)
+                   for o in found)
+
+    closed = False
+    for other, w in ws.items():
+        if other != wid and header_tag(w["label"]) and holds(other):
+            closed = close_header(other) or closed
+    if closed:
+        time.sleep(0.5)
+        normalize(mod)
+    tag = header_tag(ws[wid]["label"])
+    if tag and not guests(wid):
+        group([tag])
+
+
+def on_renamed(mod, wid, label):
+    """A space "#name" becomes the header of the new group "name"."""
+    was_header = next((r.label for r in mod.load_mapping() if r.workspace_id == wid), "").startswith(HEADER)
+    if was_header and header_tag(label) is None and label.strip() \
+            and not label.startswith(NEW_GROUP) and label != NEW_BUTTON:
+        # A header renamed without its "▦ " (by hand or by an agent) stays the header and only
+        # renames its group. As a plain space it would strand an open group's agents there.
+        label = HEADER + mod.validate_tag(label)
+        herdr("workspace", "rename", wid, label)
+    if label.startswith(NEW_GROUP) and label[len(NEW_GROUP):].strip():
+        tag = mod.validate_tag(label[len(NEW_GROUP):].strip())
+        herdr("workspace", "rename", wid, HEADER + tag)
+        mod.apply_tag(wid, tag, "", HEADER + tag)
+    elif header_tag(label):
+        tag = mod.validate_tag(header_tag(label))
+        before = next((r.tag for r in mod.load_mapping() if r.workspace_id == wid), "")
+        if before and before != tag:  # header renamed: members and position follow
+            mod.retag(before, tag)
+            order = [t for t in mod.load_config().order if t != before]
+            save_group_order(mod, order if tag in order else order + [tag])
+        mod.apply_tag(wid, tag, "", label)
+    normalize(mod)
+
+
+def on_closed(mod, label):
+    """Header closed: the group dissolves, manually assigned spaces are released."""
+    tag = header_tag(label)
+    if tag:
+        for record in mod.load_mapping():
+            if record.tag == tag:
+                mod.reset_tag(record.workspace_id)
+        normalize(mod)
+
+
+def new_space(args):
+    """Popup behind the button. An error stays visible, otherwise the popup closes it away."""
+    import traceback
+    try:
+        new_space_popup(args)
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            raise
+        message = str(exc.code)
+    except Exception:
+        message = traceback.format_exc()
+    else:
+        return
+    print(message)
+    with open(os.path.join(state_dir(), "popup-errors.log"), "a") as fh:
+        fh.write(f"{time.strftime('%F %T')} {message}\n")
+    try:
+        input("Press Enter to close")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    sys.exit(1)
+
+
+def new_space_popup(_args):
+    """Click a folder, type a name, or name a new group."""
+    home = os.path.expanduser("~")
+    dirs = [e for e in os.scandir(home) if e.is_dir() and e.name[0] != "." and e.name not in NOT_PROJECTS]
+    dirs.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+    rows = [(f"{HEADER}New group …", "!group"), ("⌂  Home", home)] + [(e.name, e.path) for e in dirs]
+    try:
+        typed, choice = pick_rows("New space> ", rows, multi=False, query=True,
+                                  header="Double-click a folder, or type a name + Enter")
+    except KeyboardInterrupt:
+        typed, choice = "", []
+    if not choice and typed.strip():  # no folder matches: the typed text is the name
+        herdr("workspace", "create", "--cwd", home, "--label", typed.strip(), "--focus")
+        return
+    if choice and choice[0] != "!group":
+        herdr("workspace", "create", "--cwd", choice[0], "--label", os.path.basename(choice[0]), "--focus")
+        return
+    if choice:
+        try:
+            name = input("Group name: ").strip()[:24]  # cut to MAX_TAG, the group name limit
+        except (EOFError, KeyboardInterrupt):
+            name = ""
+        if name:
+            herdr("workspace", "create", "--cwd", home, "--label", NEW_GROUP + name, "--no-focus")
+    # Back to where the click came from, otherwise the view stays on the button's shell.
+    # Without a previous click there is no note: then the top row.
+    try:
+        with open(origins_path() + ".last") as fh:
+            last = fh.read().strip()
+    except OSError:
+        last = ""
+    ws = workspaces()
+    fallback = next((k for k, w in ws.items() if w["label"] != NEW_BUTTON), None)
+    target = last if last in ws else fallback
+    if target:
+        herdr("workspace", "focus", target)
+
+
+def sidebar_event(args):
+    """Entry point of the plugin hooks. The run belongs to the event, not to a pane."""
+    global SELF_ENV
+    SELF_ENV = None  # herdr sets HERDR_PANE_ID to the event's pane, which is not the sender
+    os.environ.pop("HERDR_PANE_ID", None)
+    os.environ.pop("HERDR_ACTIVE_PANE_ID", None)
+    data = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}").get("data", {})
+    mod = group_store()
+    if not mod:
+        return
+    snapshot = data.get("workspace") or {}
+    wid = data.get("workspace_id") or snapshot.get("workspace_id")
+    label = snapshot.get("label", "")
+    os.makedirs(os.path.dirname(origins_path()), exist_ok=True)
+    # A drag focuses the row on release, right after the move. That must not count as a click,
+    # or dragging a header would open its group. Both hooks start at the same time, so moved
+    # writes the note before taking the lock, and focused briefly waits for it.
+    marker = origins_path() + ".moved"
+    if args[0] == "moved":
+        with open(marker, "w") as fh:
+            fh.write(f"{wid} {time.time()}")
+    elif args[0] == "focused":
+        time.sleep(0.2)
+        try:
+            with open(marker) as fh:
+                moved_id, moved_at = fh.read().split()
+            if moved_id == wid and time.time() - float(moved_at) < 1.5:
+                return
+        except (OSError, ValueError):
+            pass
+    # One run at a time. A run that had to wait checks itself whether its click still holds:
+    # a second click on the same row would never arrive as a new event.
+    with state_lock():
+        try:
+            if args[0] == "renamed":  # also workspace.created: a reopened space finds its group
+                mod.adopt()
+            if args[0] != "moved":  # moved pins the order itself, without the dragged row
+                pin_order(mod)
+            if args[0] == "moved":
+                on_moved(mod, wid)
+            elif args[0] == "focused":
+                if workspaces().get(wid, {}).get("focused"):
+                    on_focused(mod, wid)
+            elif args[0] == "renamed":
+                on_renamed(mod, wid, data.get("label") or label or workspaces().get(wid, {}).get("label", ""))
+            elif args[0] == "closed":
+                on_closed(mod, label)
+        except SystemExit as exc:  # e.g. a group without agents: no error, just nothing to show
+            print(exc.code)
+        except Exception:  # an error must not take the blank lines with it; trace to the log
+            log_error(f"sidebar-event {args[0]} {wid}")
+        sync_gaps(mod)
+
+
+def log_error(context):
+    """Traceback to stderr (plugin log) and to errors.log in hv's config dir."""
+    text = f"{time.strftime('%F %T')} {context}\n{traceback.format_exc()}"
+    print(text, file=sys.stderr)
+    try:
+        with open(os.path.join(state_dir(), "errors.log"), "a") as fh:
+            fh.write(text)
+    except OSError:
+        pass
+
+
+def group_sync(_args):
+    """Startup hook and manual command: each group gets its header, everything gets sorted."""
+    mod = group_store()
+    if not mod:
+        sys.exit("hv: groups need the local herdr server")
+    for _ in range(20):  # at server start the layout may not be restored yet, see revive
+        spaces, cwds, tags = sidebar_state(mod)
+        if spaces:
+            break
+        time.sleep(0.5)
+    else:
+        return
+    if mod.adopt(spaces, cwds):  # after a restart the spaces may carry new ids
+        spaces, cwds, tags = sidebar_state(mod)
+    pin_order(mod)
+    headers = {header_tag(s.get("label", "")): s["workspace_id"] for s in spaces}
+    headers.pop(None, None)
+    for tag in sorted(set(tags.values()) - set(headers) - {""}):
+        res = herdr("workspace", "create", "--label", HEADER + tag,
+                    "--cwd", os.path.expanduser("~"), "--no-focus")
+        headers[tag] = res["workspace"]["workspace_id"]
+        print(f"hv: created header '{HEADER + tag}'")
+    for s in spaces:
+        if s.get("label") in LEGACY_BUTTONS:
+            herdr("workspace", "rename", s["workspace_id"], NEW_BUTTON)
+            s["label"] = NEW_BUTTON
+    if not any(s.get("label") == NEW_BUTTON for s in spaces):
+        herdr("workspace", "create", "--label", NEW_BUTTON, "--cwd", os.path.expanduser("~"), "--no-focus")
+        print(f"hv: created button '{NEW_BUTTON}'")
+    for tag, wid in headers.items():
+        if tags.get(wid) != tag:
+            mod.apply_tag(wid, tag, "", HEADER + tag)
+    normalize(mod)
+    sync_gaps(mod)
+
+
+def import_space_tags(args):
+    """One-time move from herdr-space-tags: rules, order and assignments into groups.json.
+
+    Also clears the sidebar tokens space-tags left on the spaces. Disable space-tags after
+    this, otherwise both plugins sort the sidebar against each other.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        sys.exit("hv: import-space-tags reads TOML and needs Python 3.11 or newer")
+    store = group_store()
+    if not store:
+        sys.exit("hv: groups need the local herdr server")
+    if os.path.exists(store.path) and "--force" not in args:
+        sys.exit(f"hv: {store.path} exists already; --force overwrites it")
+    src = subprocess.run(["herdr", "plugin", "config-dir", "herdr-space-tags"],
+                         capture_output=True, text=True).stdout.strip()
+    config = {}
+    if src and os.path.exists(os.path.join(src, "config.toml")):
+        with open(os.path.join(src, "config.toml"), "rb") as fh:
+            config = tomllib.load(fh)
+    listed = lambda v: [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
+    rules = [{"tag": r["tag"], "labels": listed(r.get("labels")), "cwds": listed(r.get("cwds"))}
+             for r in config.get("rule", []) if isinstance(r, dict) and r.get("tag")]
+    members = {}
+    tsv = os.path.join(src, "manual.tsv") if src else ""
+    if tsv and os.path.exists(tsv):
+        for line in open(tsv, encoding="utf-8"):
+            fields = [f.strip() for f in line.rstrip("\n").split("\t")]
+            if line.lstrip().startswith("#") or len(fields) < 2 or not fields[0]:
+                continue
+            fields += ["", ""]
+            members[fields[0]] = {"tag": fields[1], "cwd": fields[2], "label": fields[3]}
+    order = listed(config.get("order"))
+    store._write({"order": order, "rules": rules, "members": members})
+    spaces, _ = store.snapshot_state()
+    for ws in spaces:
+        owned = [n for n in (ws.get("tokens") or {})
+                 if n in ("tag", "pad", "air") or n.startswith(("rule_", "head_"))]
+        if owned and not DRY:
+            herdr_text("workspace", "report-metadata", ws["workspace_id"], "--source",
+                       "plugin:herdr-space-tags", *[a for n in owned for a in ("--clear-token", n)])
+    print(f"hv: {len(members)} assignment(s), {len(rules)} rule(s), order {order} -> {store.path}")
+
+
+PANEL_LABEL = "hv panel"
+PANE_ID = re.compile(r"^w[0-9A-Za-z]+:p[0-9]+$")  # anything else is a view name
+
+
+def revive(_args):
+    """Startup hook: brings restored panel panes back to life.
+
+    After a restart herdr restores the layout and pane names but does not rerun the
+    plugin command — the pane then runs only a bare shell. So: find panes named
+    PANEL_LABEL and start `hv panel` in them. A new pane is never opened; whoever
+    had none gets none.
+    """
+    for _ in range(20):  # at server start the layout may not be restored yet
+        found = [p for p in panes() if p.get("label") == PANEL_LABEL]
+        if found:
+            break
+        time.sleep(0.5)
+    else:
+        return
+    for pane in found:
+        if panel_running(pane["pane_id"]) or not is_plain_shell(pane["pane_id"]):
+            continue  # if something else runs there, `pane run` would type into it
+        herdr_text("pane", "run", pane["pane_id"], sys.executable, os.path.realpath(__file__), "panel")
+        print(f"hv: restarted panel in {pane['pane_id']}")
+
+
+def panel_running(pane_id):
+    try:
+        info = herdr("pane", "process-info", "--pane", pane_id)["process_info"]
+    except SystemExit:
+        return False
+    return any(os.path.basename(a) == "hv" for p in info.get("foreground_processes") or []
+               for a in (p.get("argv") or [])[:2])
+
+
+def preview(args):
+    """Internal call from the fzf preview: shows what the pane is working on."""
+    if not args:
+        return
+    pane_id = args[0]
+    info = {p["pane_id"]: p for p in panes()}.get(pane_id)
+    if not info:
+        print("  (pane no longer exists)")
+        return
+    ws = workspaces().get(pane_id.split(":")[0], {})
+    state = info.get("agent_status", "unknown")
+    print(f"  {ws.get('label','?')} · {info.get('agent') or 'shell'} · {state}")
+    tok = info.get("tokens") or {}
+    meta = " ".join(tok.get(k, "") for k in ("limit", "context", "cache_high") if tok.get(k))
+    if meta:
+        print(f"  {meta}")
+    print("  " + "─" * 50)
+    text = herdr_text("pane", "read", pane_id, "--source", "visible", "--lines", "40")
+    lines = [l for l in text.splitlines() if l.strip()]
+    for line in lines[-40:]:
+        print(line[:200])
+
+
+def ls(_args):
+    views = [w for w in workspaces().values() if is_view(w["label"])]
+    if not views:
+        print("hv: no views built")
+        return
+    for w in sorted(views, key=lambda v: v["label"]):
+        focus = " ←" if w.get("focused") else ""
+        print(f"{w['label']:<16} {w['pane_count']} panels  ({w['workspace_id']}){focus}")
+
+
+def me():
+    return f"hv -m {MACHINE}" if MACHINE else "hv"
+
+
+def mflag():
+    return f"-m {shlex.quote(MACHINE)}" if MACHINE else ""
+
+
+def main():
+    global MACHINE, DRY, FORCE_COLS
+    # plugin hooks inherit the server's PATH, which may lack herdr
+    if os.environ.get("HERDR_BIN_PATH"):
+        os.environ["PATH"] = (f"{os.path.dirname(os.environ['HERDR_BIN_PATH'])}:/opt/homebrew/bin:"
+                              f"/usr/local/bin:{os.environ.get('PATH', '')}")
+    argv = sys.argv[1:]
+    while argv and argv[0] in ("-m", "--machine", "-n", "--dry-run", "-c", "--cols"):
+        if argv[0] in ("-n", "--dry-run"):
+            DRY, argv = True, argv[1:]
+        elif argv[0] in ("-c", "--cols"):
+            FORCE_COLS, argv = True, argv[1:]
+        else:
+            if len(argv) < 2:
+                sys.exit("hv: -m needs a machine name")
+            MACHINE, argv = argv[1], argv[2:]
+    if DRY:
+        print(f"hv: dry run on {MACHINE or 'Local'} — nothing will be moved")
+    cmd = argv[0] if argv else "build"
+    table = {"add": add, "eq": eq, "back": back, "ls": ls, "list": ls, "group": group,
+             "group-sync": group_sync, "sidebar-event": sidebar_event, "new-space": new_space,
+             "panel": panel, "preview": preview, "revive": revive,
+             "import-space-tags": import_space_tags}
+    if cmd in ("eq", "back", "group-sync", "import-space-tags"):
+        with state_lock():
+            table[cmd](argv[1:])
+    elif cmd in table:
+        table[cmd](argv[1:])
+    elif cmd in ("build", "new"):
+        build(argv[1:])
+    elif cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    else:
+        build(argv)
+
+
+if __name__ == "__main__":
+    main()

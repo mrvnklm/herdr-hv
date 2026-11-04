@@ -1,0 +1,5 @@
+#!/bin/sh
+# Checks the staged files only: what is in the index is what gets committed.
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$files" ] && exit 0
+exec python3 scripts/check_english.py --files $files

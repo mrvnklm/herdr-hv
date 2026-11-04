@@ -1,0 +1,68 @@
+# hv: agents from any workspace side by side, and mouse-only groups in the spaces sidebar.
+# Every command runs from the plugin root, so `hv` is called by its relative path.
+id = "hv"
+name = "hv"
+version = "0.3.0"
+min_herdr_version = "0.9.0"
+description = "Agents from any workspace side by side; mouse-only groups in the sidebar"
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "panel"
+title = "hv panel"
+placement = "split"
+command = ["python3", "hv", "panel"]
+
+[[panes]]
+id = "new-space"
+title = "New space"
+placement = "popup"
+width = "50%"
+height = "60%"
+command = ["python3", "hv", "new-space"]
+
+[[actions]]
+id = "open-panel"
+title = "hv: open panel"
+contexts = ["global", "workspace"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin hv --entrypoint panel --placement split --direction right"]
+
+[[actions]]
+id = "group-sync"
+title = "hv: rebuild group headers and sort the sidebar"
+contexts = ["global"]
+command = ["python3", "hv", "group-sync"]
+
+# After a restart herdr restores the panel pane with a bare shell in it. This restarts
+# `hv panel` in exactly those panes and never opens a new one.
+[[startup]]
+command = ["python3", "hv", "revive"]
+
+[[startup]]
+command = ["python3", "hv", "group-sync"]
+
+# The sidebar is the UI: dragging a space under a "▦ <group>" header assigns it, clicking a
+# header opens the group side by side, naming a space "#Name" creates a group.
+[[events]]
+on = "workspace.moved"
+command = ["python3", "hv", "sidebar-event", "moved"]
+
+[[events]]
+on = "workspace.focused"
+command = ["python3", "hv", "sidebar-event", "focused"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["python3", "hv", "sidebar-event", "renamed"]
+
+[[events]]
+on = "workspace.created"
+command = ["python3", "hv", "sidebar-event", "renamed"]
+
+[[events]]
+on = "workspace.closed"
+command = ["python3", "hv", "sidebar-event", "closed"]
+
+[[events]]
+on = "workspace.reordered"
+command = ["python3", "hv", "sidebar-event", "reordered"]
