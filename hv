@@ -70,13 +70,19 @@ def self_path():
     return f"{shlex.quote(sys.executable)} {shlex.quote(os.path.realpath(__file__))}"
 
 
+def run_herdr(prefix, args):
+    if not which("herdr"):
+        sys.exit("hv: herdr is not on PATH")
+    return subprocess.run(["herdr", *prefix, *args], capture_output=True, text=True)
+
+
 def herdr(*args):
     """Call the herdr CLI. In a dry run, writing commands are only printed."""
     if DRY and tuple(args[:2]) in WRITING:
         print(f"  [dry] herdr {' '.join(args)}")
         return None
     prefix = ["--machine", MACHINE] if MACHINE else []
-    p = subprocess.run(["herdr", *prefix, *args], capture_output=True, text=True)
+    p = run_herdr(prefix, args)
     if not p.stdout.strip():
         sys.exit(f"hv: `herdr {' '.join(args)}` returned nothing ({p.stderr.strip()})")
     data = json.loads(p.stdout)
@@ -106,7 +112,7 @@ def herdr_text(*args):
         print(f"  [dry] herdr {' '.join(args)}")
         return ""
     prefix = ["--machine", MACHINE] if MACHINE else []
-    p = subprocess.run(["herdr", *prefix, *args], capture_output=True, text=True)
+    p = run_herdr(prefix, args)
     return p.stdout
 
 
