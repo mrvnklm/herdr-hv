@@ -4,7 +4,7 @@ Nothing comes from the herdr server you work in: the harness strips every HERDR_
 and runs its own server under a throwaway HOME. The result is a JSON dump of the terminal
 cells; scripts/render_screen.py turns it into an image.
 
-    HV_E2E_HOME=/tmp/hv-demo python3 scripts/demo_screen.py docs/screen.json
+    HV_E2E_HOME=/tmp/hv-demo python3 scripts/demo_screen.py /tmp/screen.json
 """
 import json
 import os

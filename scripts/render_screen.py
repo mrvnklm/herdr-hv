@@ -1,7 +1,7 @@
 """Turn a terminal dump from scripts/demo_screen.py into an SVG (and a PNG with rsvg-convert).
 
-    python3 scripts/render_screen.py docs/screen.json docs/screenshot.svg
-    rsvg-convert -z 2 docs/screenshot.svg -o docs/screenshot.png
+    python3 scripts/render_screen.py /tmp/screen.json /tmp/screen.svg
+    rsvg-convert -z 2 /tmp/screen.svg -o docs/screenshot.png
 
 Box-drawing lines are drawn as strokes, not glyphs, so they meet without gaps between rows.
 """
