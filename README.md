@@ -10,6 +10,11 @@ A plugin for [herdr](https://herdr.dev). It does two things, both with the mouse
 
 hv only moves panes. It never closes or restarts an agent.
 
+![The group "backend" is open: three agents from three spaces side by side](docs/screenshot.png)
+
+*A click on `▦ backend` put the agents of `orders-api`, `billing-worker` and `search-index` side by
+side. Demo projects and fake agents, rebuilt by `scripts/demo_screen.py`.*
+
 ## Install
 
 ```sh
@@ -109,6 +114,14 @@ pip install pyte && tests/e2e/run_all.sh                  # private herdr server
 
 The end-to-end tests start their own herdr server under `/tmp/hv-e2e` and never touch the one
 you work in. `git config core.hooksPath .githooks` enables the pre-commit check.
+
+The screenshot comes from such a private server too, with made-up projects:
+
+```sh
+HV_E2E_HOME=/tmp/hv-demo python3 scripts/demo_screen.py /tmp/screen.json
+python3 scripts/render_screen.py /tmp/screen.json /tmp/screen.svg
+rsvg-convert -z 2 /tmp/screen.svg -o docs/screenshot.png
+```
 
 ## License
 
